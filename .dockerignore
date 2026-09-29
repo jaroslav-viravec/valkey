@@ -1,0 +1,8 @@
+# Keep the build context small when building this repo checkout as the context
+# (scripts/build-valkey-docker.sh). Excludes VCS metadata and packaging files
+# that the compile does not need.
+.git
+.github
+docker
+scripts
+*.md
