@@ -1,0 +1,122 @@
+# =============================================================================
+# Valkey SENTINEL image — built from valkey.io SOURCE (Bitnami-free)
+#
+# Issue #2030 / EPIC #740, "two-image" variant: this builds the `valkey-sentinel`
+# image. Its sibling docker/Dockerfile.valkey builds the `valkey` server image.
+#
+# IMPORTANT: valkey-sentinel is NOT a different program — upstream installs it as
+# a symlink to valkey-server, and the binary enters sentinel mode when launched
+# under that name (or with --sentinel). So the build stage here is IDENTICAL to
+# Dockerfile.valkey; only the default command + exposed port differ. Keeping a
+# separate image is purely to mirror Bitnami's two-image layout.
+#
+# (If you prefer ONE image for both roles, use docker/Dockerfile instead.)
+#
+# The build context is the Valkey source tree (e.g. the git/valkey checkout):
+#   docker build -f docker/Dockerfile.sentinel --build-arg VALKEY_VERSION=9.1.2 \
+#     -t valkey-sentinel:9.1.2 git/valkey
+# =============================================================================
+
+ARG BASE_IMAGE=debian:bookworm-slim
+ARG VALKEY_VERSION=9.1.2
+
+# =============================================================================
+# Stage 1: build — compile the Valkey source tree from the build context
+# =============================================================================
+FROM ${BASE_IMAGE} AS build
+
+# Build toolchain. g++ is required for USE_FAST_FLOAT=yes (Valkey 8.1+).
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        dpkg-dev \
+        gcc \
+        g++ \
+        libc6-dev \
+        libssl-dev \
+        make \
+        pkg-config; \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /usr/src/valkey
+
+# Copy the source tree (the build context) and compile it.
+COPY . .
+
+# Compile with TLS support and install into a self-contained prefix.
+RUN set -eux; \
+    make distclean >/dev/null 2>&1 || true; \
+    make -j "$(nproc)" \
+        BUILD_TLS=yes \
+        USE_FAST_FLOAT=yes \
+        all; \
+    make install PREFIX=/opt/valkey; \
+    /opt/valkey/bin/valkey-sentinel --version; \
+    strip /opt/valkey/bin/valkey-*
+
+# =============================================================================
+# Stage 2: runtime — minimal SENTINEL image + a non-root user
+# =============================================================================
+FROM ${BASE_IMAGE} AS runtime
+ARG VALKEY_VERSION
+
+LABEL org.opencontainers.image.title="valkey-sentinel" \
+      org.opencontainers.image.description="Valkey Sentinel built from valkey.io source (Bitnami-free)" \
+      org.opencontainers.image.version="${VALKEY_VERSION}" \
+      org.opencontainers.image.source="https://github.com/valkey-io/valkey" \
+      org.opencontainers.image.licenses="BSD-3-Clause"
+
+# Runtime deps only: TLS libs + a minimal init (tini) for correct signal/zombie
+# handling as PID 1.
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        libssl3 \
+        tini \
+        tzdata; \
+    rm -rf /var/lib/apt/lists/*
+
+# Copy the compiled binaries from the build stage.
+COPY --from=build /opt/valkey /opt/valkey
+ENV PATH="/opt/valkey/bin:${PATH}"
+
+# A default sentinel.conf (from upstream). Sentinel REWRITES its own config at
+# runtime, so it must live on a writable path — /opt/valkey/etc is writable by
+# uid 1001. Orchestrators (chart/operator) typically mount their own config.
+COPY --from=build /usr/src/valkey/sentinel.conf /opt/valkey/etc/sentinel.conf
+
+# Non-root user. UID/GID 1001 + group-0 perms for OpenShift arbitrary-UID.
+RUN set -eux; \
+    groupadd --gid 1001 valkey; \
+    useradd  --uid 1001 --gid 1001 --system --home-dir /data --shell /usr/sbin/nologin valkey; \
+    mkdir -p /data /opt/valkey/etc; \
+    chown -R 1001:0 /data /opt/valkey/etc; \
+    chmod -R g=u /data /opt/valkey/etc
+
+# Entrypoint (generated inline). Defaults to the SENTINEL role:
+#   - a leading flag ("-...")  -> prepend valkey-sentinel
+#   - a bare ".conf" file      -> prepend valkey-sentinel
+RUN set -eux; \
+    { \
+        echo '#!/bin/sh'; \
+        echo 'set -e'; \
+        echo 'if [ "${1#-}" != "$1" ]; then set -- valkey-sentinel "$@"; fi'; \
+        echo 'case "$1" in'; \
+        echo '  *.conf) set -- valkey-sentinel "$@" ;;'; \
+        echo 'esac'; \
+        echo 'exec "$@"'; \
+    } > /usr/local/bin/docker-entrypoint.sh; \
+    chmod +x /usr/local/bin/docker-entrypoint.sh
+
+WORKDIR /data
+VOLUME ["/data"]
+
+# Sentinel role.
+EXPOSE 26379
+
+USER 1001
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/docker-entrypoint.sh"]
+CMD ["valkey-sentinel", "/opt/valkey/etc/sentinel.conf"]
