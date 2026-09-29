@@ -1,0 +1,105 @@
+name: Build Valkey image
+
+# Build our Bitnami-free Valkey image from a PINNED release tag's source and push
+# it to GitHub Container Registry (ghcr.io/jaroslav-viravec/valkey).
+#
+# This workflow lives on the `issue2030` branch (which carries docker/Dockerfile).
+# The `issue2030` branch itself is based on `unstable` (dev version 255.255.255),
+# so we do NOT build the branch source. Instead we check out the release tag
+# chosen below and compile THAT — keeping published images pinned & reproducible.
+
+on:
+  workflow_dispatch:
+    inputs:
+      valkey_version:
+        description: "Valkey release tag to build (e.g. 9.1.2)"
+        required: true
+        default: "9.1.2"
+      platforms:
+        description: "Target platforms (comma-separated)"
+        required: true
+        default: "linux/amd64,linux/arm64"
+      push_latest:
+        description: "Also tag as :latest"
+        type: boolean
+        required: false
+        default: false
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      # 1. The packaging branch — provides docker/Dockerfile.
+      - name: Checkout packaging (docker/Dockerfile)
+        uses: actions/checkout@v4
+
+      # 2. The pinned release tag's SOURCE — this is what we compile.
+      - name: Checkout Valkey release source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.valkey_version }}
+          path: valkey-src
+
+      # Keep the build context lean (drop VCS metadata from the source tree).
+      - name: Trim build context
+        run: echo '.git' > valkey-src/.dockerignore
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image name and tags
+        id: meta
+        run: |
+          image="${REGISTRY,,}/${GITHUB_REPOSITORY,,}"
+          ver="${{ inputs.valkey_version }}"
+          {
+            echo "image=${image}"
+            echo "tags<<EOF"
+            echo "${image}:${ver}"
+            if [ "${{ inputs.push_latest }}" = "true" ]; then echo "${image}:latest"; fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ./valkey-src
+          file: ./docker/Dockerfile
+          platforms: ${{ inputs.platforms }}
+          push: true
+          build-args: |
+            VALKEY_VERSION=${{ inputs.valkey_version }}
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha,scope=valkey-${{ inputs.valkey_version }}
+          cache-to: type=gha,mode=max,scope=valkey-${{ inputs.valkey_version }}
+
+      - name: Summary
+        run: |
+          {
+            echo "### Built Valkey image"
+            echo ""
+            echo "**Version:** ${{ inputs.valkey_version }}"
+            echo "**Platforms:** ${{ inputs.platforms }}"
+            echo ""
+            echo "Tags:"
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
